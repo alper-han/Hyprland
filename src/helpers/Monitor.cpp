@@ -51,6 +51,49 @@ using namespace Hyprutils::OS;
 using enum NContentType::eContentType;
 using namespace NColorManagement;
 
+namespace {
+    constexpr char LAST_MONITOR_RESTORE_SEPARATOR = '|';
+
+    struct SLastMonitorRestoreToken {
+        std::string monitorName;
+        std::string fallbackMonitorName;
+        bool        hasFallbackHint = false;
+    };
+
+    SLastMonitorRestoreToken parseLastMonitorRestoreToken(const std::string& token) {
+        if (token.empty())
+            return {};
+
+        const auto SEPARATORPOS = token.find(LAST_MONITOR_RESTORE_SEPARATOR);
+        if (SEPARATORPOS == std::string::npos)
+            return {
+                .monitorName = token,
+            };
+
+        return {
+            .monitorName         = token.substr(0, SEPARATORPOS),
+            .fallbackMonitorName = token.substr(SEPARATORPOS + 1),
+            .hasFallbackHint     = true,
+        };
+    }
+
+    std::string makeLastMonitorRestoreToken(const std::string& monitorName, const std::string& fallbackMonitorName) {
+        return monitorName + LAST_MONITOR_RESTORE_SEPARATOR + fallbackMonitorName;
+    }
+
+    bool workspaceStillOnExpectedFallback(const PHLWORKSPACE& workspace, const std::string& fallbackMonitorName, const PHLMONITOR& reconnectingMonitor, bool hasFallbackHint = true) {
+        if (!hasFallbackHint)
+            return true;
+
+        const auto CURRENTMONITOR = workspace ? workspace->m_monitor.lock() : nullptr;
+
+        if (fallbackMonitorName.empty())
+            return !CURRENTMONITOR || CURRENTMONITOR == reconnectingMonitor;
+
+        return CURRENTMONITOR && CURRENTMONITOR->m_name == fallbackMonitorName;
+    }
+}
+
 CMonitor::CMonitor(SP<Aquamarine::IOutput> output_) : m_state(this), m_output(output_), m_imageDescription(DEFAULT_IMAGE_DESCRIPTION) {
     g_pAnimationManager->createAnimation(0.f, m_specialFade, g_pConfigManager->getAnimationPropertyConfig("specialWorkspaceIn"), AVARDAMAGE_NONE);
     m_specialFade->setUpdateCallback([this](auto) { g_pHyprRenderer->damageMonitor(m_self.lock()); });
@@ -281,15 +324,38 @@ void CMonitor::onConnect(bool noRule) {
 
     setupDefaultWS(monitorRule);
 
+    const auto SELF = m_self.lock();
+
     for (auto const& ws : g_pCompositor->getWorkspacesCopy()) {
         if (!valid(ws))
             continue;
 
-        if (ws->m_lastMonitor == m_name || g_pCompositor->m_monitors.size() == 1 /* avoid lost workspaces on recover */) {
-            g_pCompositor->moveWorkspaceToMonitor(ws, m_self.lock());
+        const bool RECOVERMONITORLAYOUT = g_pCompositor->m_monitors.size() == 1; // avoid lost workspaces on recover
+        if (RECOVERMONITORLAYOUT) {
+            g_pCompositor->moveWorkspaceToMonitor(ws, SELF);
             g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
             ws->m_lastMonitor = "";
+            continue;
         }
+
+        const auto RESTORETOKEN = parseLastMonitorRestoreToken(ws->m_lastMonitor);
+        if (RESTORETOKEN.monitorName.empty())
+            continue;
+
+        if (RESTORETOKEN.monitorName != m_name)
+            continue;
+
+        if (workspaceStillOnExpectedFallback(ws, RESTORETOKEN.fallbackMonitorName, SELF, RESTORETOKEN.hasFallbackHint)) {
+            g_pCompositor->moveWorkspaceToMonitor(ws, SELF);
+            g_pDesktopAnimationManager->startAnimation(ws, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
+        } else {
+            const auto CURRENTMONITOR = ws->m_monitor.lock();
+            Log::logger->log(Log::DEBUG, "Skipping reconnect restore for workspace {} on {}: expected fallback {}, currently on {}", ws->m_id, m_name,
+                             RESTORETOKEN.fallbackMonitorName.empty() ? "<none>" : RESTORETOKEN.fallbackMonitorName,
+                             CURRENTMONITOR ? CURRENTMONITOR->m_name : "<none>");
+        }
+
+        ws->m_lastMonitor = "";
     }
 
     m_scale = monitorRule.scale;
@@ -322,14 +388,32 @@ void CMonitor::onConnect(bool noRule) {
 
     Log::logger->log(Log::DEBUG, "checking if we have seen this monitor before: {}", m_name);
     // if we saw this monitor before, set it to the workspace it was on
-    if (g_pCompositor->m_seenMonitorWorkspaceMap.contains(m_name)) {
-        auto workspaceID = g_pCompositor->m_seenMonitorWorkspaceMap[m_name];
-        Log::logger->log(Log::DEBUG, "Monitor {} was on workspace {}, setting it to that", m_name, workspaceID);
-        auto ws = g_pCompositor->getWorkspaceByID(workspaceID);
-        if (ws) {
-            g_pCompositor->moveWorkspaceToMonitor(ws, m_self.lock());
-            changeWorkspace(ws, true, false, false);
+    if (const auto SNAPSHOTIT = g_pCompositor->m_seenMonitorWorkspaceMap.find(m_name); SNAPSHOTIT != g_pCompositor->m_seenMonitorWorkspaceMap.end()) {
+        const auto SNAPSHOT = SNAPSHOTIT->second;
+        Log::logger->log(Log::DEBUG, "Monitor {} reconnect snapshot: workspace {}, fallback {}, epoch {}", m_name, SNAPSHOT.workspaceID,
+                         SNAPSHOT.fallbackMonitor.empty() ? "<none>" : SNAPSHOT.fallbackMonitor, SNAPSHOT.disconnectEpoch);
+
+        bool restored = false;
+        if (const auto WS = g_pCompositor->getWorkspaceByID(SNAPSHOT.workspaceID); WS) {
+            const auto CURRENTMONITOR = WS->m_monitor.lock();
+            const bool ALREADYONTHIS  = CURRENTMONITOR == SELF;
+            if (ALREADYONTHIS || workspaceStillOnExpectedFallback(WS, SNAPSHOT.fallbackMonitor, SELF)) {
+                if (!ALREADYONTHIS)
+                    g_pCompositor->moveWorkspaceToMonitor(WS, SELF);
+                changeWorkspace(WS, true, false, false);
+                restored = true;
+            } else {
+                Log::logger->log(Log::DEBUG, "Skipping monitor snapshot restore for {}: expected fallback {}, currently on {}", m_name,
+                                 SNAPSHOT.fallbackMonitor.empty() ? "<none>" : SNAPSHOT.fallbackMonitor, CURRENTMONITOR ? CURRENTMONITOR->m_name : "<none>");
+            }
+        } else {
+            Log::logger->log(Log::DEBUG, "Skipping monitor snapshot restore for {}: workspace {} no longer exists", m_name, SNAPSHOT.workspaceID);
         }
+
+        if (restored)
+            Log::logger->log(Log::DEBUG, "Applied monitor snapshot restore for {} to workspace {}", m_name, SNAPSHOT.workspaceID);
+
+        g_pCompositor->m_seenMonitorWorkspaceMap.erase(SNAPSHOTIT);
     } else
         Log::logger->log(Log::DEBUG, "Monitor {} was not on any workspace", m_name);
 
@@ -369,21 +453,37 @@ void CMonitor::onDisconnect(bool destroy) {
     if (g_pHyprOpenGL)
         g_pHyprOpenGL->destroyMonitorResources(m_self);
 
-    // record what workspace this monitor was on
-    if (m_activeWorkspace) {
-        Log::logger->log(Log::DEBUG, "Disconnecting Monitor {} was on workspace {}", m_name, m_activeWorkspace->m_id);
-        g_pCompositor->m_seenMonitorWorkspaceMap[m_name] = m_activeWorkspace->m_id;
-    }
-
-    // Cleanup everything. Move windows back, snap cursor, shit.
     PHLMONITOR BACKUPMON = nullptr;
-    for (auto const& m : g_pCompositor->m_monitors) {
-        if (m.get() != this) {
-            BACKUPMON = m;
-            break;
+
+    if (const auto FOCUSMON = Desktop::focusState()->monitor(); FOCUSMON && FOCUSMON.get() != this && FOCUSMON->m_enabled)
+        BACKUPMON = FOCUSMON;
+
+    if (!BACKUPMON) {
+        for (auto const& m : g_pCompositor->m_monitors) {
+            if (m.get() != this && m->m_enabled) {
+                BACKUPMON = m;
+                break;
+            }
         }
     }
 
+    // record what workspace this monitor was on
+    if (m_activeWorkspace) {
+        const auto FALLBACKNAME = BACKUPMON ? BACKUPMON->m_name : "";
+        const auto EPOCH        = ++g_pCompositor->m_monitorDisconnectEpoch;
+        Log::logger->log(Log::DEBUG, "Disconnecting monitor {} was on workspace {} (fallback {}, epoch {})", m_name, m_activeWorkspace->m_id,
+                         FALLBACKNAME.empty() ? "<none>" : FALLBACKNAME, EPOCH);
+
+        g_pCompositor->m_seenMonitorWorkspaceMap[m_name] = {
+            .workspaceID     = m_activeWorkspace->m_id,
+            .fallbackMonitor = FALLBACKNAME,
+            .disconnectEpoch = EPOCH,
+        };
+    } else {
+        g_pCompositor->m_seenMonitorWorkspaceMap.erase(m_name);
+    }
+
+    // Cleanup everything. Move windows back, snap cursor, shit.
     // remove mirror
     if (m_mirrorOf) {
         m_mirrorOf->m_mirrors.erase(std::ranges::find_if(m_mirrorOf->m_mirrors, [&](const auto& other) { return other == m_self; }));
@@ -436,7 +536,7 @@ void CMonitor::onDisconnect(bool destroy) {
         }
 
         for (auto const& w : wspToMove) {
-            w->m_lastMonitor = m_name;
+            w->m_lastMonitor = makeLastMonitorRestoreToken(m_name, BACKUPMON->m_name);
             g_pCompositor->moveWorkspaceToMonitor(w, BACKUPMON);
             g_pDesktopAnimationManager->startAnimation(w, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
         }

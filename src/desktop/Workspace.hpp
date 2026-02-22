@@ -57,7 +57,7 @@ class CWorkspace {
     bool m_defaultFloating = false;
     bool m_defaultPseudo   = false;
 
-    // last monitor (used on reconnect)
+    // reconnect token: "<monitor>" (legacy) or "<monitor>|<fallback-monitor>"
     std::string m_lastMonitor = "";
 
     bool        m_wasCreatedEmpty = true;

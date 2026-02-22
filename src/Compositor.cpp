@@ -2626,17 +2626,31 @@ PHLWINDOW CCompositor::getForceFocus() {
 }
 
 void CCompositor::scheduleMonitorStateRecheck() {
-    static bool scheduled = false;
+    static bool scheduled        = false;
+    static bool needsAnotherPass = false;
 
-    if (!scheduled) {
-        scheduled = true;
-        g_pEventLoopManager->doLater([this] {
+    needsAnotherPass = true;
+
+    if (scheduled)
+        return;
+
+    scheduled = true;
+    g_pEventLoopManager->doLater([this] {
+        needsAnotherPass = false;
+        arrangeMonitors();
+        checkMonitorOverlaps();
+
+        if (needsAnotherPass) {
+            needsAnotherPass = false;
             arrangeMonitors();
             checkMonitorOverlaps();
+        }
 
-            scheduled = false;
-        });
-    }
+        scheduled = false;
+
+        if (needsAnotherPass)
+            scheduleMonitorStateRecheck();
+    });
 }
 
 void CCompositor::checkMonitorOverlaps() {
