@@ -121,7 +121,10 @@ void CMonitor::onConnect(bool noRule) {
     m_zoomAnimProgress->setValueAndWarp(0.F);
     m_zoomAnimFrameCounter = 0;
 
-    g_pEventLoopManager->doLater([] { g_pConfigManager->ensurePersistentWorkspacesPresent(); });
+    g_pEventLoopManager->doLater([] {
+        g_pConfigManager->ensurePersistentWorkspacesPresent();
+        g_pCompositor->ensureWorkspacesOnAssignedMonitors();
+    });
 
     m_listeners.frame      = m_output->events.frame.listen([this] {
         if (m_frameScheduler)
